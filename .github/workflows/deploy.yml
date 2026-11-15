@@ -1,0 +1,80 @@
+name: Deploy travel website from ZIP
+on:
+  push:
+    branches: [main]
+    paths: ['site.zip', '.github/workflows/deploy.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate and extract ZIP
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import zipfile, pathlib, stat, re, json
+          root = pathlib.Path('public')
+          root.mkdir()
+          with zipfile.ZipFile('site.zip') as z:
+              names = set()
+              for i in z.infolist():
+                  p = pathlib.PurePosixPath(i.filename)
+                  if p.is_absolute() or '..' in p.parts or '\\' in i.filename or stat.S_ISLNK(i.external_attr >> 16) or i.filename in names:
+                      raise ValueError('Unsafe or duplicate ZIP member: ' + i.filename)
+                  names.add(i.filename)
+              if sum(i.file_size for i in z.infolist()) > 500_000_000:
+                  raise ValueError('ZIP exceeds extraction limit')
+              if z.testzip() is not None:
+                  raise ValueError('ZIP CRC failure')
+              z.extractall(root)
+          required = ['index.html','cloud-bridge.js','cloud-check.js','cloud-pages.js','firebase-config.js','migration.js','version.json']
+          for name in required:
+              if not (root/name).is_file() or not (root/name).stat().st_size:
+                  raise ValueError('Missing or empty: '+name)
+          config = (root/'firebase-config.js').read_text()
+          assert re.search(r'"?projectId"?\s*:\s*["\']m-core-travel["\']', config), 'Wrong Firebase project'
+          for p in root.rglob('*'):
+              if p.is_file() and p.suffix.lower() in ('.html','.js','.json','.css','.mjs'):
+                  s = p.read_text(encoding='utf-8')
+                  if re.search(r'shanghai-suzhou-(lab|test)', s, re.I):
+                      raise ValueError('Old Firebase/site identifier in '+str(p))
+          from html.parser import HTMLParser
+          from urllib.parse import urlsplit, unquote
+          class Assets(HTMLParser):
+              def handle_starttag(self, tag, attrs):
+                  a = dict(attrs)
+                  v = a.get('src') if tag in ('script','img','source','iframe') else a.get('href') if tag == 'link' else None
+                  if not v: return
+                  u = urlsplit(v)
+                  if u.scheme or u.netloc or not u.path: return
+                  if u.path.startswith('/'): raise ValueError('Root-relative resource: '+v)
+                  p = (root/unquote(u.path)).resolve()
+                  if not p.is_relative_to(root.resolve()) or not p.is_file(): raise ValueError('Missing resource: '+v)
+          Assets().feed((root/'index.html').read_text())
+          print('Validated version:', json.loads((root/'version.json').read_text()))
+          for name in ('README.txt','firestore.rules','validation.json'):
+              (root/name).unlink(missing_ok=True)
+          (root/'.nojekyll').touch()
+          PY
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
